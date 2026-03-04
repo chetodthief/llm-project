@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model files (ML/LLM)
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
