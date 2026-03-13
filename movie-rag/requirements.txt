@@ -1,0 +1,11 @@
+langchain
+langchain-community
+langchain-core
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+transformers
+pandas
+streamlit
+tiktoken
+accelerate
