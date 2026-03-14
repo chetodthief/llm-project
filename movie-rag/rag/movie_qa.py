@@ -1,78 +1,102 @@
 import os
-# --- เพิ่มส่วนนี้: ตั้งค่า Cache ไปยัง Drive D ก่อน import library อื่นๆ ---
+import sys
+import pickle
+import torch
+from dotenv import load_dotenv
+
+# --- 1. ตั้งค่า Cache และ Environment Variables ---
 os.environ['HF_HOME'] = 'D:/huggingface_cache'
 os.environ['HUGGINGFACE_HUB_CACHE'] = 'D:/huggingface_cache'
-import os
+
+# โหลดตัวแปรจากไฟล์ .env (เพื่อซ่อน Token)
+load_dotenv()
 token = os.getenv("HF_TOKEN")
 
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-from langchain_huggingface import HuggingFacePipeline
-from langchain_core.prompts import PromptTemplate
-import torch
-
-
-# --- เพิ่มส่วนนี้: สั่ง Login (ระบบจะข้ามไปถ้าเคย Login ในเครื่องนี้แล้ว) ---
-# หรือใช้ login(token="your_token_here") ถ้าไม่อยากพิมพ์ใน terminal
+# --- 2. Imports Library ทั้งหมด ---
 from huggingface_hub import login
-login(token=token)
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+from langchain_core.prompts import PromptTemplate
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
+
+# สั่ง Login ด้วย Token ที่ซ่อนไว้
+if token:
+    login(token=token)
+else:
+    print("Warning: HF_TOKEN not found in .env file!")
 
 def load_vectorstore(index_dir):
-    """Loads the FAISS index with SentencePiece embeddings."""
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    """โหลด FAISS และ BM25 เพื่อทำงานร่วมกันแบบ Hybrid Search"""
+    model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embeddings = HuggingFaceEmbeddings(model_name=model_name)
     
-    # Allow dangerous deserialization is required in recent langchain updates 
-    # for loading local pickle files securely
     vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
-    return vectorstore
+    faiss_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+    
+    bm25_path = os.path.join(index_dir, "bm25_retriever.pkl")
+    with open(bm25_path, "rb") as f:
+        bm25_retriever = pickle.load(f)
+        
+    bm25_retriever.k = 5
+    
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_retriever], weights=[0.5, 0.5]
+    )
+    return ensemble_retriever
 
 def load_llm():
-    """Loads a lightweight Instruct model (Qwen 1.5B) to prevent Out-Of-Memory crashes."""
-    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
-    
+    """โหลด Llama 3 ด้วย 4-bit Quantization เพื่อประหยัด VRAM"""
+    model_id = "meta-llama/Llama-3.2-3B-Instruct"
     print(f"Loading tokenizer for {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
     print(f"Loading model {model_id} (Saving to Drive D)...")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
     
-    # เพิ่มการใช้ 4-bit quantization เพื่อประหยัด VRAM (Optional)
-    # หากมีการ์ดจอแรงๆ (24GB+) สามารถเอา load_in_4bit ออกได้
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         device_map="auto",
-        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        # cache_dir="D:/huggingface_cache" # ระบุซ้ำเพื่อความชัวร์
+        quantization_config=bnb_config,
     )
     
     pipe = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=256,
-        temperature=0.3, # Slightly higher temperature to prevent getting stuck
+        max_new_tokens=512, # เพิ่ม token เผื่อให้อธิบายยาวขึ้นได้
+        temperature=0.3,
         top_p=0.9,
         do_sample=True,
-        repetition_penalty=1.1, # Prevent repeating "I don't know"
-        return_full_text=False
+        repetition_penalty=1.1,
+        return_full_text=False,
+        pad_token_id=tokenizer.eos_token_id # แก้ปัญหา Warning สแปมหน้าจอ
     )
     
-    llm = HuggingFacePipeline(pipeline=pipe)
-    return llm
+    return HuggingFacePipeline(pipeline=pipe)
 
-# Define the RAG prompt template based on Qwen's ChatML format
-prompt_template = """<|im_start|>system
-You are a helpful movie expert assistant. Your job is to answer the user's question using the provided movie plot context. 
-If the information is in the context, synthesize it into a clear answer.
-If the answer is truly not present in the context, politely state that you cannot answer based on the given information.<|im_end|>
-<|im_start|>user
+# --- 3. ปรับจูน Prompt Engineering สำหรับแนะนำหนังและภาษาไทย ---
+prompt_template = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a knowledgeable and friendly movie expert assistant. Your job is to answer the user's question using the provided movie plot context.
+
+CRITICAL RULES:
+1. If the user asks for a movie recommendation based on a genre or theme (e.g., "หนังผี", "action", "ผีหลอกๆ"), analyze the context and recommend the movies that fit the description. Do NOT say you don't know the movie name.
+2. ALWAYS answer in the SAME LANGUAGE as the user's question. If the question is in Thai, translate your thoughts and answer in Thai naturally.
+3. If the exact answer is not in the context, you can use your general knowledge, but prioritize the context first.
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
 Here is the movie plot context:
 {context}
 
 Based on the context above, answer the following question:
-{question}<|im_end|>
-<|im_start|>assistant
+{question}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
 """
 
 PROMPT = PromptTemplate(
@@ -81,46 +105,46 @@ PROMPT = PromptTemplate(
 )
 
 def answer_question(question, vectorstore, llm):
-    """
-    Retrieves the most relevant plot chunks for a question,
-    sends them to the LLM, and returns the generated answer 
-    along with the source documents.
-    """
-    # Retrieve top 3 most relevant chunks with their similarity scores (L2 distance in FAISS)
-    # Note: For FAISS L2, lower score is better (more similar)
-    docs_and_scores = vectorstore.similarity_search_with_score(question, k=3)
+    """ค้นหาข้อมูลและส่งให้ LLM ตอบคำถาม"""
+    docs = vectorstore.invoke(question)
     
     contexts = []
     sources = []
     
-    for doc, score in docs_and_scores:
-        contexts.append(doc.page_content)
+    for doc in docs:
+        title = doc.metadata.get("title", "Unknown")
+        genre = doc.metadata.get("genre", "Unknown")
+        year = doc.metadata.get("year", "Unknown")
+        director = doc.metadata.get("director", "Unknown")
+        cast = doc.metadata.get("cast", "Unknown")
+        
+        context_str = (
+            f"Title: {title}\n"
+            f"Release Year: {year}\n"
+            f"Director: {director}\n"
+            f"Cast: {cast}\n"
+            f"Genre: {genre}\n"
+            f"Plot: {doc.page_content}"
+        )
+        contexts.append(context_str)
+        
         sources.append({
-            "title": doc.metadata.get("title", "Unknown"),
-            "genre": doc.metadata.get("genre", "Unknown"),
-            "year": doc.metadata.get("year", "Unknown"),
-            "origin": doc.metadata.get("origin", "Unknown"),
-            "director": doc.metadata.get("director", "Unknown"),
-            "cast": doc.metadata.get("cast", "Unknown"),
-            "wiki_page": doc.metadata.get("wiki_page", "Unknown"),
-            "score": float(score),
+            "title": title,
+            "genre": genre,
+            "year": year,
+            "director": director,
+            "cast": cast,
+            "score": "Hybrid",
             "content": doc.page_content
         })
         
     combined_context = "\n\n".join(contexts)
-    
-    # Format the prompt
     final_prompt = PROMPT.format(context=combined_context, question=question)
     
-    # Generate the answer using the LLM with a terminator to stop after answering
     print(f"\nGenerating answer for: '{question}'...")
     
-    terminators = [
-        "<|im_end|>", 
-        "<|endoftext|>"
-    ]
-    
-    answer = llm.invoke(final_prompt, stop=terminators)
+    # ส่ง Stop words ให้ LLM หยุดพิมพ์เมื่อจบประโยค
+    answer = llm.invoke(final_prompt, stop=["<|eot_id|>", "<|end_of_text|>"])
     
     return {
         "answer": answer.strip(),
@@ -128,7 +152,6 @@ def answer_question(question, vectorstore, llm):
     }
 
 if __name__ == "__main__":
-    import sys
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     index_dir = os.path.join(base_dir, "data", "faiss_index")
     
@@ -140,8 +163,8 @@ if __name__ == "__main__":
     vectorstore = load_vectorstore(index_dir)
     llm = load_llm()
     
-    # Test Question
-    test_q = "What happens at the end of Titanic?"
+    # ทดสอบด้วยคำถามภาษาไทยและแนวหนัง
+    test_q = "แนะนำหนังแนวผีหลอกๆ ให้หน่อยครับ"
     result = answer_question(test_q, vectorstore, llm)
     
     print("\n" + "="*50)
@@ -150,4 +173,4 @@ if __name__ == "__main__":
     print("="*50)
     print("\nSources:")
     for i, src in enumerate(result['sources']):
-        print(f"{i+1}. Movie: {src['title']} (Score: {src['score']:.4f})")
+        print(f"{i+1}. Movie: {src['title']} ({src['year']}) - Genre: {src['genre']}")
